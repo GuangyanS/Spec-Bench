@@ -5,7 +5,7 @@
         "name": "Python: inference_baseline",
         "type": "python",
         "request": "launch",
-        "module": "evaluation.inference_baseline",
+        "module": "evaluation.inference_sps",
         "pythonPath": "/home/sunguangyan/miniconda3/envs/spec/bin/python",
         "cwd": "${workspaceFolder}",
         "console": "integratedTerminal",
@@ -21,9 +21,10 @@
           "CUDA_VISIBLE_DEVICES": "0"
         },
         "args": [
-          "--model-path", "openai-community/gpt2",
+          "--model-path", "openai-community/gpt2-xl",
+          "--drafter-path", "openai-community/gpt2",
           "--model-id", "vicuna-68m-vanilla-float16-temp-0.0",
-          "--bench-name", "openwebtext",
+          "--bench-name", "cnn_dailymail",
           "--dtype", "float16",
           "--temperature", "0.0"
         ]

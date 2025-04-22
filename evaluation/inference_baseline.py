@@ -17,6 +17,7 @@ def baseline_forward(inputs, model, tokenizer, max_new_tokens, temperature=0.0, 
         attention_mask = inputs["attention_mask"]
     else:
         input_ids = inputs.input_ids
+        attention_mask = inputs.attention_mask
     output_ids = model.generate(
         input_ids,
         attention_mask=attention_mask,

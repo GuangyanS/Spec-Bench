@@ -11,6 +11,7 @@ import time
 import torch
 import numpy as np
 import shortuuid
+import random
 
 from fastchat.llm_judge.common import load_questions
 from fastchat.model import get_conversation_template
@@ -55,14 +56,14 @@ def run_eval(
         num_gpus_per_model,
         num_gpus_total,
         dataset_type="spec_bench",
-        max_cnndm_questions=200,
-        max_owt_samples=200,
+        max_cnndm_questions=20,
+        max_owt_samples=20,
         owt_context_length=768,
-        filter_by_length=False,
+        filter_by_length=True,
         max_length=1024,
         **kwargs,
 ):
-    if dataset_type == "spec_bench":
+    if dataset_type == "spec_bench" or dataset_type == "mt_bench":
         questions = load_questions(question_file, question_begin, question_end)
         get_answers = get_model_answers
     elif dataset_type == "cnn_dailymail":
@@ -72,22 +73,32 @@ def run_eval(
         # Apply maximum limit if needed
         if filter_by_length and hasattr(tokenizer, "encode"):
             print(f"Filtering CNN/DailyMail articles by token count (max: {max_length})")
-            # Calculate token counts for each article
+            # Find articles under the token limit
+            short_articles = []
             article_lengths = []
+            max_token_threshold = 700  # Filter to articles under this token length
+            
             for article in full_questions:
                 tokens = tokenizer.encode(article, truncation=False, add_special_tokens=False)
-                article_lengths.append((len(tokens), article))
+                token_length = len(tokens)
+                article_lengths.append(token_length)
+                
+                if token_length < max_token_threshold:
+                    short_articles.append(article)
             
-            # Sort by token count (ascending)
-            article_lengths.sort(key=lambda x: x[0])
+            print(f"Found {len(short_articles)} articles under {max_token_threshold} tokens")
+            print(f"Range of token counts in dataset: {min(article_lengths)} - {max(article_lengths)}")
             
-            # Take the shortest max_cnndm_questions articles
-            filtered_articles = [article for length, article in article_lengths[:max_cnndm_questions]]
-            
-            print(f"Original range of token counts: {article_lengths[0][0]} - {article_lengths[-1][0]}")
-            print(f"After filtering, range of token counts: {article_lengths[0][0]} - {article_lengths[max_cnndm_questions-1][0]}")
-            
-            questions = filtered_articles
+            # Randomly select articles if we have more than we need
+            if len(short_articles) > max_cnndm_questions:
+                # Set a seed for reproducibility
+                random.seed(42)
+                questions = random.sample(short_articles, max_cnndm_questions)
+                print(f"Randomly selected {max_cnndm_questions} articles from {len(short_articles)} eligible articles")
+            else:
+                # If we don't have enough articles under the threshold, take all we have
+                questions = short_articles
+                print(f"Using all {len(short_articles)} articles under the token threshold (fewer than requested {max_cnndm_questions})")
         else:
             # Standard limit without token count filtering
             questions = full_questions[:max_cnndm_questions]
@@ -332,6 +343,11 @@ def get_model_answers_cnn(
     cuda_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES')
     print('CUDA VISIBLE DEVICES:', cuda_visible_devices)
 
+    # Set pad token id if needed
+    if tokenizer.pad_token_id is None and hasattr(tokenizer, "eos_token_id"):
+        print("Pad token ID not set. Using EOS token as pad token.")
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
     article = articles[0]
 
     # warmup
@@ -367,7 +383,7 @@ def get_model_answers_cnn(
             inputs,
             model,
             tokenizer,
-            max_new_tokens,
+            256,
             **kwargs,
         )
         torch.cuda.synchronize()
@@ -428,6 +444,11 @@ def get_model_answers_cnn(
             inputs = tokenizer([prompt], return_tensors="pt").to("cuda")
             input_ids = inputs.input_ids
             
+            # Create attention mask if not present
+            if 'attention_mask' not in inputs:
+                attention_mask = torch.ones_like(input_ids).to("cuda")
+                inputs['attention_mask'] = attention_mask
+            
             try:
                 torch.cuda.synchronize()
                 start_time = time.time()
@@ -435,7 +456,7 @@ def get_model_answers_cnn(
                     inputs,
                     model,
                     tokenizer,
-                    max_new_tokens,
+                    256,
                     **kwargs,
                 )
                 torch.cuda.synchronize()
@@ -659,15 +680,39 @@ def get_model_answers_owt(
 
 
 def reorg_answer_file(answer_file):
-    """Sort by question id and de-duplication"""
+    """Sort by ID and de-duplication across different dataset types"""
     answers = {}
     with open(answer_file, "r") as fin:
         for l in fin:
-            qid = json.loads(l)["question_id"]
-            answers[qid] = l
+            data = json.loads(l)
+            # Handle different ID fields based on dataset type
+            if "question_id" in data:
+                # For spec_bench dataset
+                id_key = data["question_id"]
+            elif "article_idx" in data:
+                # For CNN/DailyMail dataset
+                id_key = f"article_{data['article_idx']}"
+            elif "context_idx" in data:
+                # For OpenWebText dataset
+                id_key = f"context_{data['context_idx']}"
+            else:
+                # Fallback to answer_id if no other ID is available
+                id_key = data["answer_id"]
+            
+            answers[id_key] = l
 
-    qids = sorted(list(answers.keys()))
+    # Sort IDs while keeping dataset types grouped
+    sorted_ids = sorted(list(answers.keys()))
+    
     with open(answer_file, "w") as fout:
-        for qid in qids:
-            fout.write(answers[qid])
+        for id_key in sorted_ids:
+            fout.write(answers[id_key])
+    
+    print(f"Reorganized {len(sorted_ids)} entries in {answer_file}")
+    
+    # Print dataset type statistics
+    spec_bench_count = sum(1 for id_key in sorted_ids if not id_key.startswith(("article_", "context_")))
+    cnn_count = sum(1 for id_key in sorted_ids if id_key.startswith("article_"))
+    owt_count = sum(1 for id_key in sorted_ids if id_key.startswith("context_"))
+    print(f"Dataset stats: Spec-Bench: {spec_bench_count}, CNN/DailyMail: {cnn_count}, OpenWebText: {owt_count}")
 
