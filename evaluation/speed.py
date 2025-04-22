@@ -74,8 +74,8 @@ def get_single_speedup(jsonl_file, jsonl_file_base, tokenizer_path):
         speed(jsonl_file, jsonl_file_base, tokenizer_path, task=subtask_name)
 
 
-def get_mean_speedup():
-    tokenizer_path="/home/xiaheming/data/pretrained_models/Vicuna/vicuna-7b-v1.3/"
+def get_mean_speedup(tokenizer_path, jsonl_file_name, jsonl_file_base_name):
+    tokenizer_path="lmsys/vicuna-7b-v1.3"
     jsonl_file_name = "vicuna-7b-v1.3-samd.jsonl"
     jsonl_file_base_name = "vicuna-7b-v1.3-vanilla-float16-temp-0.0.jsonl"
     jsonl_file_run_list = [
@@ -137,18 +137,18 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--tokenizer-path",
-        default='/home/xiaheming/data/pretrained_models/Vicuna/vicuna-7b-v1.3',
+        default='lmsys/vicuna-7b-v1.3',
         type=str,
         help="The file path of evaluated baseline.",
     )
     parser.add_argument(
         "--mean-report",
         action="store_true",
-        default=True,
+        default=False,
         help="report mean speedup over different runs")
 
     args = parser.parse_args()
     if args.mean_report:
-        get_mean_speedup()
+        get_mean_speedup(tokenizer_path=args.tokenizer_path, jsonl_file_name=args.file_path, jsonl_file_base_name=args.base_path)
     else:
         get_single_speedup(jsonl_file=args.file_path, jsonl_file_base=args.base_path, tokenizer_path=args.tokenizer_path)

@@ -15,7 +15,31 @@ import shortuuid
 from fastchat.llm_judge.common import load_questions
 from fastchat.model import get_conversation_template
 from tqdm import tqdm
+from datasets import load_dataset
 
+def load_openwebtext_data(bin_file, max_samples=200, context_length=768):
+    """Load data from OpenWebText binary file."""
+    # Load binary data
+    print(f"Loading OpenWebText data from {bin_file}")
+    data = np.memmap(bin_file, dtype=np.uint16, mode='r')
+    
+    # Find valid starting points for sequences
+    samples = []
+    sample_count = 0
+    
+    # Try to find samples with at least context_length tokens
+    idx = 0
+    while idx < len(data) - context_length and sample_count < max_samples:
+        # Take a chunk of data and ensure it's at least context_length
+        context = data[idx:idx+context_length].tolist()
+        samples.append(context)
+        sample_count += 1
+        
+        # Move to next potential sample (with some overlap possible)
+        idx += context_length  # Could add randomness here if desired
+    
+    print(f"Loaded {len(samples)} OpenWebText samples")
+    return samples
 
 def run_eval(
         model,
@@ -30,9 +54,56 @@ def run_eval(
         num_choices,
         num_gpus_per_model,
         num_gpus_total,
+        dataset_type="spec_bench",
+        max_cnndm_questions=200,
+        max_owt_samples=200,
+        owt_context_length=768,
+        filter_by_length=False,
+        max_length=1024,
         **kwargs,
 ):
-    questions = load_questions(question_file, question_begin, question_end)
+    if dataset_type == "spec_bench":
+        questions = load_questions(question_file, question_begin, question_end)
+        get_answers = get_model_answers
+    elif dataset_type == "cnn_dailymail":
+        # Load CNN/DailyMail dataset with a maximum limit
+        full_questions = load_dataset("cnn_dailymail", "3.0.0", split="validation", streaming=False)["article"][question_begin:question_end]
+        
+        # Apply maximum limit if needed
+        if filter_by_length and hasattr(tokenizer, "encode"):
+            print(f"Filtering CNN/DailyMail articles by token count (max: {max_length})")
+            # Calculate token counts for each article
+            article_lengths = []
+            for article in full_questions:
+                tokens = tokenizer.encode(article, truncation=False, add_special_tokens=False)
+                article_lengths.append((len(tokens), article))
+            
+            # Sort by token count (ascending)
+            article_lengths.sort(key=lambda x: x[0])
+            
+            # Take the shortest max_cnndm_questions articles
+            filtered_articles = [article for length, article in article_lengths[:max_cnndm_questions]]
+            
+            print(f"Original range of token counts: {article_lengths[0][0]} - {article_lengths[-1][0]}")
+            print(f"After filtering, range of token counts: {article_lengths[0][0]} - {article_lengths[max_cnndm_questions-1][0]}")
+            
+            questions = filtered_articles
+        else:
+            # Standard limit without token count filtering
+            questions = full_questions[:max_cnndm_questions]
+            
+        print(f"Loaded {len(questions)} CNN/DailyMail articles (limited to max {max_cnndm_questions})")
+        get_answers = get_model_answers_cnn
+    elif dataset_type == "openwebtext":
+        # For OpenWebText, question_file should be the path to the binary file
+        questions = load_openwebtext_data(
+            "data/openwebtext/val.bin", 
+            max_samples=max_owt_samples, 
+            context_length=owt_context_length
+        )
+        get_answers = get_model_answers_owt
+    else:
+        raise ValueError(f"Unsupported dataset type: {dataset_type}")
 
     # Split the question file into `num_gpus` files
     assert num_gpus_total % num_gpus_per_model == 0
@@ -42,10 +113,10 @@ def run_eval(
         import ray
         ray.init()
         get_answers_func = ray.remote(num_gpus=num_gpus_per_model)(
-            get_model_answers
+            get_answers
         ).remote
     else:
-        get_answers_func = get_model_answers
+        get_answers_func = get_answers
 
     chunk_size = len(questions) // (num_gpus_total // num_gpus_per_model)  # // 2
     ans_handles = []
@@ -239,6 +310,351 @@ def get_model_answers(
                 "tstamp": time.time(),
             }
             fout.write(json.dumps(ans_json) + "\n")
+    print("#Mean accepted tokens: ", np.mean(accept_lengths_tree))
+
+
+@torch.inference_mode()
+def get_model_answers_cnn(
+        model,
+        tokenizer,
+        forward_func,
+        model_id,
+        articles,
+        answer_file,
+        max_new_tokens,
+        num_choices,
+        max_length=1024,
+        **kwargs,
+):
+    model.eval()
+    print('Check model training state:', model.training)
+
+    cuda_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES')
+    print('CUDA VISIBLE DEVICES:', cuda_visible_devices)
+
+    article = articles[0]
+
+    # warmup
+    for _ in range(3):
+        torch.manual_seed(0)
+        conv = get_conversation_template("vicuna")
+        summary = ""
+        steps = 0
+        new_tokens = 0
+        wall_time = 0
+        
+        # For CNN dataset, we use the article directly instead of turns
+        qs = f"Summarize the following article: {article}"
+        
+        # Check article token length and truncate if necessary
+        article_tokens = tokenizer.encode(qs, truncation=False, add_special_tokens=False)
+        if len(article_tokens) > max_length - 100:  # Leave room for prompt and generation
+            print(f"Truncating warmup article from {len(article_tokens)} tokens to fit max_length={max_length}")
+            # Decode just enough tokens to fit within max_length
+            truncated_tokens = article_tokens[:max_length - 100]
+            qs = tokenizer.decode(truncated_tokens, skip_special_tokens=True)
+        
+        conv.append_message(conv.roles[0], qs)
+        conv.append_message(conv.roles[1], None)
+        conv.stop_str = "</s>"
+        prompt = conv.get_prompt()
+        inputs = tokenizer([prompt], return_tensors="pt").to("cuda")
+        input_ids = inputs.input_ids
+        
+        torch.cuda.synchronize()
+        start_time = time.time()
+        output_ids, new_token, step, accept_length_tree = forward_func(
+            inputs,
+            model,
+            tokenizer,
+            max_new_tokens,
+            **kwargs,
+        )
+        torch.cuda.synchronize()
+        total_time = time.time() - start_time
+        output_ids = output_ids[0][len(input_ids[0]):]
+        
+        # be consistent with the template's stop_token_ids
+        if conv.stop_token_ids:
+            stop_token_ids_index = [
+                i
+                for i, id in enumerate(output_ids)
+                if id in conv.stop_token_ids
+            ]
+            if len(stop_token_ids_index) > 0:
+                output_ids = output_ids[: stop_token_ids_index[0]]
+
+        output = tokenizer.decode(
+            output_ids,
+            spaces_between_special_tokens=False,
+        )
+        if conv.stop_str and output.find(conv.stop_str) > 0:
+            output = output[: output.find(conv.stop_str)]
+        for special_token in tokenizer.special_tokens_map.values():
+            if isinstance(special_token, list):
+                for special_tok in special_token:
+                    output = output.replace(special_tok, "")
+            else:
+                output = output.replace(special_token, "")
+        output = output.strip()
+
+        if conv.name == "xgen" and output.startswith("Assistant:"):
+            output = output.replace("Assistant:", "", 1).strip()
+    
+    print('Warmup done')
+
+    accept_lengths_tree = []
+    for idx, article in enumerate(tqdm(articles)):
+        choices = []
+        for i in range(num_choices):
+            cur_accept_lengths_tree = []
+            torch.manual_seed(i)
+            conv = get_conversation_template("vicuna")
+            
+            # For CNN dataset, process the article as a single input
+            qs = f"Summarize the following article: {article}"
+            
+            # Check article token length and truncate if necessary
+            article_tokens = tokenizer.encode(qs, truncation=False, add_special_tokens=False)
+            if len(article_tokens) > max_length - 100:  # Leave room for prompt and generation
+                # Decode just enough tokens to fit within max_length
+                truncated_tokens = article_tokens[:max_length - 100]
+                qs = tokenizer.decode(truncated_tokens, skip_special_tokens=True)
+            
+            conv.append_message(conv.roles[0], qs)
+            conv.append_message(conv.roles[1], None)
+            conv.stop_str = "</s>"
+            prompt = conv.get_prompt()
+            inputs = tokenizer([prompt], return_tensors="pt").to("cuda")
+            input_ids = inputs.input_ids
+            
+            try:
+                torch.cuda.synchronize()
+                start_time = time.time()
+                output_ids, new_token, step, accept_length_tree = forward_func(
+                    inputs,
+                    model,
+                    tokenizer,
+                    max_new_tokens,
+                    **kwargs,
+                )
+                torch.cuda.synchronize()
+                total_time = time.time() - start_time
+                accept_lengths_tree.extend(accept_length_tree)
+                output_ids = output_ids[0][len(input_ids[0]):]
+
+                if conv.stop_token_ids:
+                    stop_token_ids_index = [
+                        i
+                        for i, id in enumerate(output_ids)
+                        if id in conv.stop_token_ids
+                    ]
+                    if len(stop_token_ids_index) > 0:
+                        output_ids = output_ids[: stop_token_ids_index[0]]
+
+                output = tokenizer.decode(
+                    output_ids,
+                    spaces_between_special_tokens=False,
+                )
+                if conv.stop_str and output.find(conv.stop_str) > 0:
+                    output = output[: output.find(conv.stop_str)]
+                for special_token in tokenizer.special_tokens_map.values():
+                    if isinstance(special_token, list):
+                        for special_tok in special_token:
+                            output = output.replace(special_tok, "")
+                    else:
+                        output = output.replace(special_token, "")
+                output = output.strip()
+
+                if conv.name == "xgen" and output.startswith("Assistant:"):
+                    output = output.replace("Assistant:", "", 1).strip()
+            except RuntimeError as e:
+                print("ERROR article index: ", idx)
+                output = "ERROR"
+
+            # Store results for this choice
+            choices.append({
+                "index": i, 
+                "summary": output, 
+                "decoding_steps": int(step), 
+                "new_tokens": int(new_token), 
+                "wall_time": total_time,
+                "accept_lengths": cur_accept_lengths_tree
+            })
+
+        # Dump answers
+        os.makedirs(os.path.dirname(answer_file), exist_ok=True)
+        with open(os.path.expanduser(answer_file), "a") as fout:
+            ans_json = {
+                "article_idx": idx,
+                "article": article[:100] + "...",  # Store a snippet of the article for reference
+                "answer_id": shortuuid.uuid(),
+                "model_id": model_id,
+                "choices": choices,
+                "tstamp": time.time(),
+            }
+            fout.write(json.dumps(ans_json) + "\n")
+    
+    print("#Mean accepted tokens: ", np.mean(accept_lengths_tree))
+
+
+@torch.inference_mode()
+def get_model_answers_owt(
+        model,
+        tokenizer,
+        forward_func,
+        model_id,
+        contexts,
+        answer_file,
+        max_new_tokens,
+        num_choices,
+        **kwargs,
+):
+    model.eval()
+    print('Check model training state:', model.training)
+
+    cuda_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES')
+    print('CUDA VISIBLE DEVICES:', cuda_visible_devices)
+
+    # Decode a sample context to check
+    sample_context = tokenizer.decode([int(token) for token in contexts[0]])
+    print(f"Sample context (truncated): {sample_context[:100]}...")
+
+    # Set pad token id if needed
+    if tokenizer.pad_token_id is None and hasattr(tokenizer, "eos_token_id"):
+        print("Pad token ID not set. Using EOS token as pad token.")
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    # warmup
+    for _ in range(3):
+        torch.manual_seed(0)
+        context_tokens = contexts[0]
+        
+        # Convert numpy tokens to input_ids format
+        input_ids = torch.tensor([context_tokens], dtype=torch.long).to("cuda")
+        
+        # Create attention mask (1 for all tokens)
+        attention_mask = torch.ones_like(input_ids).to("cuda")
+        
+        torch.cuda.synchronize()
+        start_time = time.time()
+        output_ids, new_token, step, accept_length_tree = forward_func(
+            {"input_ids": input_ids, "attention_mask": attention_mask},  # Include attention mask
+            model,
+            tokenizer,
+            256,
+            **kwargs,
+        )
+        torch.cuda.synchronize()
+        total_time = time.time() - start_time
+        
+        # Get only the newly generated tokens
+        output_ids = output_ids[0][len(input_ids[0]):]
+        
+        output = tokenizer.decode(
+            output_ids,
+            spaces_between_special_tokens=False,
+        )
+        
+        # Clean up any special tokens
+        for special_token in tokenizer.special_tokens_map.values():
+            if isinstance(special_token, list):
+                for special_tok in special_token:
+                    output = output.replace(special_tok, "")
+            else:
+                output = output.replace(special_token, "")
+        output = output.strip()
+    
+    print('Warmup done')
+
+    accept_lengths_tree = []
+    for idx, context_tokens in enumerate(tqdm(contexts)):
+        choices = []
+        for i in range(num_choices):
+            cur_accept_lengths_tree = []
+            torch.manual_seed(i)
+            
+            # Convert numpy tokens to input_ids format
+            input_ids = torch.tensor([context_tokens], dtype=torch.long).to("cuda")
+            
+            # Create attention mask (1 for all tokens)
+            attention_mask = torch.ones_like(input_ids).to("cuda")
+            
+            try:
+                torch.cuda.synchronize()
+                start_time = time.time()
+                output_ids, new_token, step, accept_length_tree = forward_func(
+                    {"input_ids": input_ids, "attention_mask": attention_mask},  # Include attention mask
+                    model,
+                    tokenizer,
+                    256,
+                    **kwargs,
+                )
+                torch.cuda.synchronize()
+                total_time = time.time() - start_time
+                accept_lengths_tree.extend(accept_length_tree)
+                
+                # Get only the newly generated tokens
+                generated_ids = output_ids[0][len(input_ids[0]):]
+
+                # Decode the full completion
+                context_str = tokenizer.decode(
+                    input_ids[0],
+                    spaces_between_special_tokens=False,
+                )
+                
+                # Decode just the newly generated content
+                output = tokenizer.decode(
+                    generated_ids,
+                    spaces_between_special_tokens=False,
+                )
+                
+                # Clean up any special tokens
+                for special_token in tokenizer.special_tokens_map.values():
+                    if isinstance(special_token, list):
+                        for special_tok in special_token:
+                            output = output.replace(special_tok, "")
+                    else:
+                        output = output.replace(special_token, "")
+                output = output.strip()
+                
+            except RuntimeError as e:
+                print("ERROR context index: ", idx)
+                print(e)
+                output = "ERROR"
+                total_time = 0
+                step = 0
+                new_token = 0
+
+            # Store results for this choice
+            choices.append({
+                "index": i, 
+                "completion": output, 
+                "decoding_steps": int(step), 
+                "new_tokens": int(new_token), 
+                "wall_time": total_time,
+                "accept_lengths": cur_accept_lengths_tree
+            })
+
+        # Decode context for reference (truncated to save space)
+        context_str = tokenizer.decode(
+            input_ids[0],
+            spaces_between_special_tokens=False,
+        )
+        
+        # Dump answers
+        os.makedirs(os.path.dirname(answer_file), exist_ok=True)
+        with open(os.path.expanduser(answer_file), "a") as fout:
+            ans_json = {
+                "context_idx": idx,
+                "context": context_str[:100] + "...",  # Store a snippet of the context
+                "answer_id": shortuuid.uuid(),
+                "model_id": model_id,
+                "choices": choices,
+                "tstamp": time.time(),
+            }
+            fout.write(json.dumps(ans_json) + "\n")
+    
     print("#Mean accepted tokens: ", np.mean(accept_lengths_tree))
 
 

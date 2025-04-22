@@ -12,12 +12,18 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 def baseline_forward(inputs, model, tokenizer, max_new_tokens, temperature=0.0, do_sample=False):
-    input_ids = inputs.input_ids
+    if isinstance(inputs, dict):
+        input_ids = inputs["input_ids"]
+        attention_mask = inputs["attention_mask"]
+    else:
+        input_ids = inputs.input_ids
     output_ids = model.generate(
         input_ids,
+        attention_mask=attention_mask,
         do_sample=do_sample,
         temperature=temperature,
         max_new_tokens=max_new_tokens,
+        pad_token_id=tokenizer.eos_token_id
     )
     new_token = len(output_ids[0][len(input_ids[0]):])
     step = new_token
@@ -86,7 +92,7 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
-
+    
     question_file = f"data/{args.bench_name}/question.jsonl"
 
     if args.answer_file:
@@ -125,6 +131,7 @@ if __name__ == "__main__":
         num_gpus_total=args.num_gpus_total,
         temperature=args.temperature,
         do_sample=do_sample,
+        dataset_type=args.bench_name,
     )
 
     reorg_answer_file(answer_file)

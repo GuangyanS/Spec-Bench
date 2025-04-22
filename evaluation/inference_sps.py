@@ -14,11 +14,16 @@ from model.sps.decoding import assisted_decoding
 
 
 def sps_forward(inputs, model, tokenizer, max_new_tokens, do_sample=False, temperature=0.0, drafter=None, num_assistant_tokens=8, num_assistant_tokens_schedule='constant'):
-    input_ids = inputs.input_ids
+    if isinstance(inputs, dict):
+        input_ids = inputs["input_ids"]
+        attention_mask = inputs["attention_mask"]
+    else:
+        input_ids = inputs.input_ids
+        attention_mask = inputs.attention_mask
     model.generation_config.max_new_tokens = max_new_tokens
     output_ids, idx, accept_length_list = model.generate(
         **inputs, generation_config=model.generation_config, assistant_model=drafter, do_sample=do_sample, temperature=temperature,
-        num_assistant_tokens=num_assistant_tokens, num_assistant_tokens_schedule=num_assistant_tokens_schedule)
+        num_assistant_tokens=num_assistant_tokens, num_assistant_tokens_schedule=num_assistant_tokens_schedule, pad_token_id=tokenizer.eos_token_id)
     new_token = len(output_ids[0][len(input_ids[0]):])
     return output_ids, new_token, idx+1, accept_length_list
 
@@ -139,6 +144,7 @@ if __name__ == "__main__":
         drafter=drafter,
         temperature=args.temperature,
         do_sample=do_sample,
+        dataset_type=args.bench_name,
     )
 
     reorg_answer_file(answer_file)

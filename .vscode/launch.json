@@ -6,31 +6,26 @@
         "type": "python",
         "request": "launch",
         "module": "evaluation.inference_baseline",
-        "pythonPath": "/pscratch/sd/guangyan/.conda/envs/spec/bin/python",
+        "pythonPath": "/home/sunguangyan/miniconda3/envs/spec/bin/python",
         "cwd": "${workspaceFolder}",
         "console": "integratedTerminal",
         "env": {
-          "Vicuna_PATH": "openai-community/gpt2-xl",
-          "Eagle_PATH": "/your_own_path/EAGLE-Vicuna-7B-v1.3",
-          "Eagle3_PATH": "/your_own_path/EAGLE3-Vicuna1.3-13B",
-          "Medusa_PATH": "/your_own_path/medusa-vicuna-7b-v1.3",
           "Hydra_PATH": "/your_own_path/hydra-vicuna-7b-v1.3",
           "Drafter_PATH": "double7/vicuna-68m",
           "Space_PATH": "/your_own_path/vicuna-v1.3-7b-space",
           "datastore_PATH": "./model/rest/datastore/datastore_chat_large.idx",
           "MODEL_NAME": "vicuna-7b-v1.3",
-          "TEMP": "0.0",
           "GPU_DEVICES": "0",
           "bench_NAME": "spec_bench",
           "torch_dtype": "float16",
           "CUDA_VISIBLE_DEVICES": "0"
         },
         "args": [
-          "--model-path", "${env:Vicuna_PATH}",
-          "--model-id", "${env:MODEL_NAME}-vanilla-${env:torch_dtype}-temp-${env:TEMP}",
-          "--bench-name", "${env:bench_NAME}",
-          "--temperature", "${env:TEMP}",
-          "--dtype", "${env:torch_dtype}"
+          "--model-path", "openai-community/gpt2",
+          "--model-id", "vicuna-68m-vanilla-float16-temp-0.0",
+          "--bench-name", "openwebtext",
+          "--dtype", "float16",
+          "--temperature", "0.0"
         ]
       }
     ]
