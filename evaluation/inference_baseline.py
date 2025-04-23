@@ -103,12 +103,21 @@ if __name__ == "__main__":
 
     print(f"Output to {answer_file}")
 
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
-        torch_dtype=str_to_torch_dtype(args.dtype),
-        low_cpu_mem_usage=True,
-        device_map="auto"
-    )
+    if "gpt2" in args.model_path:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_path,
+            torch_dtype=str_to_torch_dtype(args.dtype),
+            low_cpu_mem_usage=True,
+            device_map="auto"
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_path,
+            torch_dtype=str_to_torch_dtype(args.dtype),
+            low_cpu_mem_usage=True,
+            device_map="auto",
+            attn_implementation="flash_attention_2",
+        )
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
 

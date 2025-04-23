@@ -18,29 +18,30 @@ from fastchat.model import get_conversation_template
 from tqdm import tqdm
 from datasets import load_dataset
 
-def load_openwebtext_data(bin_file, max_samples=200, context_length=768):
-    """Load data from OpenWebText binary file."""
-    # Load binary data
-    print(f"Loading OpenWebText data from {bin_file}")
+def load_binary_data(bin_file, max_samples=None):
+    """Load data from binary file."""
+    print(f"Loading binary data from {bin_file}")
     data = np.memmap(bin_file, dtype=np.uint16, mode='r')
     
-    # Find valid starting points for sequences
-    samples = []
-    sample_count = 0
+    # If the data is 2D (shaped as samples x tokens), reshape it
+    if os.path.exists(bin_file.replace('.bin', '_metadata.json')):
+        # Load metadata for CNN/DailyMail
+        with open(bin_file.replace('.bin', '_metadata.json'), 'r') as f:
+            metadata = json.load(f)
+        max_length = metadata['max_length']
+        num_samples = len(metadata['lengths'])
+        data = data.reshape(num_samples, max_length)
+    else:
+        # For OpenWebText, infer shape from max_samples and context_length
+        context_length = 768  # Default OpenWebText context length
+        num_samples = len(data) // context_length
+        data = data.reshape(num_samples, context_length)
     
-    # Try to find samples with at least context_length tokens
-    idx = 0
-    while idx < len(data) - context_length and sample_count < max_samples:
-        # Take a chunk of data and ensure it's at least context_length
-        context = data[idx:idx+context_length].tolist()
-        samples.append(context)
-        sample_count += 1
-        
-        # Move to next potential sample (with some overlap possible)
-        idx += context_length  # Could add randomness here if desired
+    if max_samples is not None:
+        data = data[:max_samples]
     
-    print(f"Loaded {len(samples)} OpenWebText samples")
-    return samples
+    print(f"Loaded {len(data)} samples")
+    return data
 
 def run_eval(
         model,
@@ -56,62 +57,19 @@ def run_eval(
         num_gpus_per_model,
         num_gpus_total,
         dataset_type="spec_bench",
-        max_cnndm_questions=200,
-        max_owt_samples=200,
-        owt_context_length=768,
-        filter_by_length=True,
-        max_length=1024,
+        max_samples=200,
         **kwargs,
 ):
     if dataset_type == "spec_bench" or dataset_type == "mt_bench":
         questions = load_questions(question_file, question_begin, question_end)
         get_answers = get_model_answers
     elif dataset_type == "cnn_dailymail":
-        # Load CNN/DailyMail dataset with a maximum limit
-        full_questions = load_dataset("cnn_dailymail", "3.0.0", split="validation", streaming=False)["article"][question_begin:question_end]
-        
-        # Apply maximum limit if needed
-        if filter_by_length and hasattr(tokenizer, "encode"):
-            print(f"Filtering CNN/DailyMail articles by token count (max: {max_length})")
-            # Find articles under the token limit
-            short_articles = []
-            article_lengths = []
-            max_token_threshold = 700  # Filter to articles under this token length
-            
-            for article in full_questions:
-                tokens = tokenizer.encode(article, truncation=False, add_special_tokens=False)
-                token_length = len(tokens)
-                article_lengths.append(token_length)
-                
-                if token_length < max_token_threshold:
-                    short_articles.append(article)
-            
-            print(f"Found {len(short_articles)} articles under {max_token_threshold} tokens")
-            print(f"Range of token counts in dataset: {min(article_lengths)} - {max(article_lengths)}")
-            
-            # Randomly select articles if we have more than we need
-            if len(short_articles) > max_cnndm_questions:
-                # Set a seed for reproducibility
-                random.seed(42)
-                questions = random.sample(short_articles, max_cnndm_questions)
-                print(f"Randomly selected {max_cnndm_questions} articles from {len(short_articles)} eligible articles")
-            else:
-                # If we don't have enough articles under the threshold, take all we have
-                questions = short_articles
-                print(f"Using all {len(short_articles)} articles under the token threshold (fewer than requested {max_cnndm_questions})")
-        else:
-            # Standard limit without token count filtering
-            questions = full_questions[:max_cnndm_questions]
-            
-        print(f"Loaded {len(questions)} CNN/DailyMail articles (limited to max {max_cnndm_questions})")
+        # Load pre-selected CNN/DailyMail samples from binary file
+        questions = load_binary_data("data/cnn_dailymail/val_200.bin", max_samples)
         get_answers = get_model_answers_cnn
     elif dataset_type == "openwebtext":
-        # For OpenWebText, question_file should be the path to the binary file
-        questions = load_openwebtext_data(
-            "data/openwebtext/val.bin", 
-            max_samples=max_owt_samples, 
-            context_length=owt_context_length
-        )
+        # Load pre-selected OpenWebText samples from binary file
+        questions = load_binary_data("data/openwebtext/val_200.bin", max_samples)
         get_answers = get_model_answers_owt
     else:
         raise ValueError(f"Unsupported dataset type: {dataset_type}")
@@ -129,22 +87,37 @@ def run_eval(
     else:
         get_answers_func = get_answers
 
-    chunk_size = len(questions) // (num_gpus_total // num_gpus_per_model)  # // 2
+    chunk_size = len(questions) // (num_gpus_total // num_gpus_per_model)
     ans_handles = []
     for i in range(0, len(questions), chunk_size):
-        ans_handles.append(
-            get_answers_func(
-                model,
-                tokenizer,
-                forward_func,
-                model_id,
-                questions[i: i + chunk_size],
-                answer_file,
-                max_new_tokens,
-                num_choices,
-                **kwargs,
+        # Only pass max_new_tokens for spec_bench/mt_bench
+        if dataset_type in ["spec_bench", "mt_bench"]:
+            ans_handles.append(
+                get_answers_func(
+                    model,
+                    tokenizer,
+                    forward_func,
+                    model_id,
+                    questions[i: i + chunk_size],
+                    answer_file,
+                    max_new_tokens,
+                    num_choices,
+                    **kwargs,
+                )
             )
-        )
+        else:
+            ans_handles.append(
+                get_answers_func(
+                    model,
+                    tokenizer,
+                    forward_func,
+                    model_id,
+                    questions[i: i + chunk_size],
+                    answer_file,
+                    num_choices,
+                    **kwargs,
+                )
+            )
 
     if use_ray:
         ray.get(ans_handles)
@@ -330,11 +303,9 @@ def get_model_answers_cnn(
         tokenizer,
         forward_func,
         model_id,
-        articles,
+        token_data,
         answer_file,
-        max_new_tokens,
         num_choices,
-        max_length=1024,
         **kwargs,
 ):
     model.eval()
@@ -343,111 +314,36 @@ def get_model_answers_cnn(
     cuda_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES')
     print('CUDA VISIBLE DEVICES:', cuda_visible_devices)
 
-    # Set pad token id if needed
-    if tokenizer.pad_token_id is None and hasattr(tokenizer, "eos_token_id"):
-        print("Pad token ID not set. Using EOS token as pad token.")
-        tokenizer.pad_token_id = tokenizer.eos_token_id
+    # Load metadata for original articles if available
+    metadata_file = "data/cnn_dailymail/val_200_metadata.json"
+    original_articles = None
+    if os.path.exists(metadata_file):
+        with open(metadata_file, 'r') as f:
+            metadata = json.load(f)
+            original_articles = metadata['articles']
 
-    article = articles[0]
-
-    # warmup
-    for _ in range(3):
-        torch.manual_seed(0)
-        conv = get_conversation_template("vicuna")
-        summary = ""
-        steps = 0
-        new_tokens = 0
-        wall_time = 0
-        
-        # For CNN dataset, we use the article directly instead of turns
-        qs = f"Summarize the following article: {article}"
-        
-        # Check article token length and truncate if necessary
-        article_tokens = tokenizer.encode(qs, truncation=False, add_special_tokens=False)
-        if len(article_tokens) > max_length - 100:  # Leave room for prompt and generation
-            print(f"Truncating warmup article from {len(article_tokens)} tokens to fit max_length={max_length}")
-            # Decode just enough tokens to fit within max_length
-            truncated_tokens = article_tokens[:max_length - 100]
-            qs = tokenizer.decode(truncated_tokens, skip_special_tokens=True)
-        
-        conv.append_message(conv.roles[0], qs)
-        conv.append_message(conv.roles[1], None)
-        conv.stop_str = "</s>"
-        prompt = conv.get_prompt()
-        inputs = tokenizer([prompt], return_tensors="pt").to("cuda")
-        input_ids = inputs.input_ids
-        
-        torch.cuda.synchronize()
-        start_time = time.time()
-        output_ids, new_token, step, accept_length_tree = forward_func(
-            inputs,
-            model,
-            tokenizer,
-            256,
-            **kwargs,
-        )
-        torch.cuda.synchronize()
-        total_time = time.time() - start_time
-        output_ids = output_ids[0][len(input_ids[0]):]
-        
-        # be consistent with the template's stop_token_ids
-        if conv.stop_token_ids:
-            stop_token_ids_index = [
-                i
-                for i, id in enumerate(output_ids)
-                if id in conv.stop_token_ids
-            ]
-            if len(stop_token_ids_index) > 0:
-                output_ids = output_ids[: stop_token_ids_index[0]]
-
-        output = tokenizer.decode(
-            output_ids,
-            spaces_between_special_tokens=False,
-        )
-        if conv.stop_str and output.find(conv.stop_str) > 0:
-            output = output[: output.find(conv.stop_str)]
-        for special_token in tokenizer.special_tokens_map.values():
-            if isinstance(special_token, list):
-                for special_tok in special_token:
-                    output = output.replace(special_tok, "")
-            else:
-                output = output.replace(special_token, "")
-        output = output.strip()
-
-        if conv.name == "xgen" and output.startswith("Assistant:"):
-            output = output.replace("Assistant:", "", 1).strip()
-    
-    print('Warmup done')
-
-    accept_lengths_tree = []
-    for idx, article in enumerate(tqdm(articles)):
+    # Process each sample
+    for idx, tokens in enumerate(tqdm(token_data)):
         choices = []
         for i in range(num_choices):
-            cur_accept_lengths_tree = []
             torch.manual_seed(i)
             conv = get_conversation_template("vicuna")
             
-            # For CNN dataset, process the article as a single input
-            qs = f"Summarize the following article: {article}"
+            # Get the article text - either from metadata or decode tokens
+            if original_articles:
+                article = original_articles[idx]
+            else:
+                # Remove padding (zeros) from tokens
+                valid_tokens = tokens[tokens != 0]
+                article = tokenizer.decode(valid_tokens.tolist())
             
-            # Check article token length and truncate if necessary
-            article_tokens = tokenizer.encode(qs, truncation=False, add_special_tokens=False)
-            if len(article_tokens) > max_length - 100:  # Leave room for prompt and generation
-                # Decode just enough tokens to fit within max_length
-                truncated_tokens = article_tokens[:max_length - 100]
-                qs = tokenizer.decode(truncated_tokens, skip_special_tokens=True)
-            
+            qs = f"Summarize:\n{article.strip()}\nSummary:"
             conv.append_message(conv.roles[0], qs)
             conv.append_message(conv.roles[1], None)
             conv.stop_str = "</s>"
             prompt = conv.get_prompt()
             inputs = tokenizer([prompt], return_tensors="pt").to("cuda")
             input_ids = inputs.input_ids
-            
-            # Create attention mask if not present
-            if 'attention_mask' not in inputs:
-                attention_mask = torch.ones_like(input_ids).to("cuda")
-                inputs['attention_mask'] = attention_mask
             
             try:
                 torch.cuda.synchronize()
@@ -461,7 +357,6 @@ def get_model_answers_cnn(
                 )
                 torch.cuda.synchronize()
                 total_time = time.time() - start_time
-                accept_lengths_tree.extend(accept_length_tree)
                 output_ids = output_ids[0][len(input_ids[0]):]
 
                 if conv.stop_token_ids:
@@ -492,15 +387,18 @@ def get_model_answers_cnn(
             except RuntimeError as e:
                 print("ERROR article index: ", idx)
                 output = "ERROR"
+                total_time = 0
+                step = 0
+                new_token = 0
+                accept_length_tree = []
 
-            # Store results for this choice
             choices.append({
                 "index": i, 
                 "summary": output, 
                 "decoding_steps": int(step), 
                 "new_tokens": int(new_token), 
                 "wall_time": total_time,
-                "accept_lengths": cur_accept_lengths_tree
+                "accept_lengths": accept_length_tree  # Use the per-choice accept_length_tree
             })
 
         # Dump answers
@@ -508,7 +406,7 @@ def get_model_answers_cnn(
         with open(os.path.expanduser(answer_file), "a") as fout:
             ans_json = {
                 "article_idx": idx,
-                "article": article[:100] + "...",  # Store a snippet of the article for reference
+                "article": article[:100] + "...",  # Store a snippet of the article
                 "answer_id": shortuuid.uuid(),
                 "model_id": model_id,
                 "choices": choices,
@@ -516,7 +414,7 @@ def get_model_answers_cnn(
             }
             fout.write(json.dumps(ans_json) + "\n")
     
-    print("#Mean accepted tokens: ", np.mean(accept_lengths_tree))
+    print("#Mean accepted tokens: ", np.mean(accept_length_tree))
 
 
 @torch.inference_mode()
@@ -525,9 +423,8 @@ def get_model_answers_owt(
         tokenizer,
         forward_func,
         model_id,
-        contexts,
+        token_data,
         answer_file,
-        max_new_tokens,
         num_choices,
         **kwargs,
 ):
@@ -537,75 +434,21 @@ def get_model_answers_owt(
     cuda_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES')
     print('CUDA VISIBLE DEVICES:', cuda_visible_devices)
 
-    # Decode a sample context to check
-    sample_context = tokenizer.decode([int(token) for token in contexts[0]])
-    print(f"Sample context (truncated): {sample_context[:100]}...")
-
-    # Set pad token id if needed
-    if tokenizer.pad_token_id is None and hasattr(tokenizer, "eos_token_id"):
-        print("Pad token ID not set. Using EOS token as pad token.")
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-
-    # warmup
-    for _ in range(3):
-        torch.manual_seed(0)
-        context_tokens = contexts[0]
-        
-        # Convert numpy tokens to input_ids format
-        input_ids = torch.tensor([context_tokens], dtype=torch.long).to("cuda")
-        
-        # Create attention mask (1 for all tokens)
-        attention_mask = torch.ones_like(input_ids).to("cuda")
-        
-        torch.cuda.synchronize()
-        start_time = time.time()
-        output_ids, new_token, step, accept_length_tree = forward_func(
-            {"input_ids": input_ids, "attention_mask": attention_mask},  # Include attention mask
-            model,
-            tokenizer,
-            256,
-            **kwargs,
-        )
-        torch.cuda.synchronize()
-        total_time = time.time() - start_time
-        
-        # Get only the newly generated tokens
-        output_ids = output_ids[0][len(input_ids[0]):]
-        
-        output = tokenizer.decode(
-            output_ids,
-            spaces_between_special_tokens=False,
-        )
-        
-        # Clean up any special tokens
-        for special_token in tokenizer.special_tokens_map.values():
-            if isinstance(special_token, list):
-                for special_tok in special_token:
-                    output = output.replace(special_tok, "")
-            else:
-                output = output.replace(special_token, "")
-        output = output.strip()
-    
-    print('Warmup done')
-
-    accept_lengths_tree = []
-    for idx, context_tokens in enumerate(tqdm(contexts)):
+    # Process each sample
+    for idx, tokens in enumerate(tqdm(token_data)):
         choices = []
         for i in range(num_choices):
-            cur_accept_lengths_tree = []
             torch.manual_seed(i)
             
-            # Convert numpy tokens to input_ids format
-            input_ids = torch.tensor([context_tokens], dtype=torch.long).to("cuda")
-            
-            # Create attention mask (1 for all tokens)
+            # Convert tokens to input format
+            input_ids = torch.tensor([tokens.tolist()], dtype=torch.long).to("cuda")
             attention_mask = torch.ones_like(input_ids).to("cuda")
             
             try:
                 torch.cuda.synchronize()
                 start_time = time.time()
                 output_ids, new_token, step, accept_length_tree = forward_func(
-                    {"input_ids": input_ids, "attention_mask": attention_mask},  # Include attention mask
+                    {"input_ids": input_ids, "attention_mask": attention_mask},
                     model,
                     tokenizer,
                     256,
@@ -613,7 +456,6 @@ def get_model_answers_owt(
                 )
                 torch.cuda.synchronize()
                 total_time = time.time() - start_time
-                accept_lengths_tree.extend(accept_length_tree)
                 
                 # Get only the newly generated tokens
                 generated_ids = output_ids[0][len(input_ids[0]):]
@@ -646,6 +488,7 @@ def get_model_answers_owt(
                 total_time = 0
                 step = 0
                 new_token = 0
+                accept_length_tree = []
 
             # Store results for this choice
             choices.append({
@@ -654,7 +497,7 @@ def get_model_answers_owt(
                 "decoding_steps": int(step), 
                 "new_tokens": int(new_token), 
                 "wall_time": total_time,
-                "accept_lengths": cur_accept_lengths_tree
+                "accept_lengths": accept_length_tree  # Use the per-choice accept_length_tree
             })
 
         # Decode context for reference (truncated to save space)
@@ -676,7 +519,7 @@ def get_model_answers_owt(
             }
             fout.write(json.dumps(ans_json) + "\n")
     
-    print("#Mean accepted tokens: ", np.mean(accept_lengths_tree))
+    print("#Mean accepted tokens: ", np.mean(accept_length_tree))
 
 
 def reorg_answer_file(answer_file):
@@ -709,10 +552,3 @@ def reorg_answer_file(answer_file):
             fout.write(answers[id_key])
     
     print(f"Reorganized {len(sorted_ids)} entries in {answer_file}")
-    
-    # Print dataset type statistics
-    spec_bench_count = sum(1 for id_key in sorted_ids if not id_key.startswith(("article_", "context_")))
-    cnn_count = sum(1 for id_key in sorted_ids if id_key.startswith("article_"))
-    owt_count = sum(1 for id_key in sorted_ids if id_key.startswith("context_"))
-    print(f"Dataset stats: Spec-Bench: {spec_bench_count}, CNN/DailyMail: {cnn_count}, OpenWebText: {owt_count}")
-
