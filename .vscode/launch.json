@@ -5,8 +5,8 @@
         "name": "Python: inference_baseline",
         "type": "python",
         "request": "launch",
-        "module": "evaluation.inference_sps",
-        "pythonPath": "/home/sunguangyan/miniconda3/envs/spec/bin/python",
+        "module": "evaluation.inference_eagle",
+        "pythonPath": "/pscratch/sd/g/guangyan/.conda/envs/spec/bin/python",
         "cwd": "${workspaceFolder}",
         "console": "integratedTerminal",
         "env": {
@@ -21,12 +21,27 @@
           "CUDA_VISIBLE_DEVICES": "0"
         },
         "args": [
-          "--model-path", "openai-community/gpt2-xl",
-          "--drafter-path", "openai-community/gpt2",
+          // "--model-path", "lmsys/vicuna-7b-v1.3",
+          "--base-model-path", "lmsys/vicuna-7b-v1.3",
+          "--ea-model-path", "yuhuili/EAGLE-Vicuna-33B-v1.3",
+          // "--drafter-path", "openai-community/gpt2",
           "--model-id", "vicuna-68m-vanilla-float16-temp-0.0",
-          "--bench-name", "cnn_dailymail",
+          "--bench-name", "spec_bench",
           "--dtype", "float16",
           "--temperature", "0.0"
+        ]
+      },
+      {
+        "name": "Python: CNN/DailyMail Speed Evaluation",
+        "type": "python",
+        "request": "launch",
+        "program": "${workspaceFolder}/evaluation/speed.py",
+        "pythonPath": "/pscratch/sd/g/guangyan/.conda/envs/spec/bin/python",
+        "cwd": "${workspaceFolder}",
+        "console": "integratedTerminal",
+        "args": [
+          "--file-path", "data/cnn_dailymail/model_answer/vicuna-7b-v1.3-sps-68m-float16-temp-0.0.jsonl",
+          "--base-path", "data/cnn_dailymail/model_answer/vicuna-7b-v1.3-vanilla-float16-temp-0.0.jsonl",
         ]
       }
     ]

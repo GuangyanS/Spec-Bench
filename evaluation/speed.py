@@ -15,19 +15,31 @@ def speed(jsonl_file, jsonl_file_base, tokenizer, task=None, report=True):
             if task=="overall":
                 data.append(json_obj)
             elif task == "mt_bench":
-                if json_obj["category"] in mt_bench_list:
+                if "category" in json_obj and json_obj["category"] in mt_bench_list:
+                    data.append(json_obj)
+            elif task == "owt":
+                if "context" in json_obj:
+                    data.append(json_obj)
+            elif task == "cnndm":
+                if "article" in json_obj:
                     data.append(json_obj)
             else:
-                if json_obj["category"] == task:
+                if "category" in json_obj and json_obj["category"] == task:
                     data.append(json_obj)
 
     speeds=[]
     accept_lengths_list = []
     for datapoint in data:
-        tokens=sum(datapoint["choices"][0]['new_tokens'])
-        times = sum(datapoint["choices"][0]['wall_time'])
-        accept_lengths_list.extend(datapoint["choices"][0]['accept_lengths'])
-        speeds.append(tokens/times)
+        if isinstance(datapoint["choices"][0]['new_tokens'], list):
+            tokens=sum(datapoint["choices"][0]['new_tokens'])
+            times = sum(datapoint["choices"][0]['wall_time'])
+            accept_lengths_list.extend(datapoint["choices"][0]['accept_lengths'])
+            speeds.append(tokens/times)
+        else:
+            tokens = datapoint["choices"][0]['new_tokens']
+            times = datapoint["choices"][0]['wall_time']
+            accept_lengths_list.extend(datapoint["choices"][0]['accept_lengths'])
+            speeds.append(tokens/times)
 
 
     data = []
@@ -37,24 +49,49 @@ def speed(jsonl_file, jsonl_file_base, tokenizer, task=None, report=True):
             if task=="overall":
                 data.append(json_obj)
             elif task == "mt_bench":
-                if json_obj["category"] in mt_bench_list:
+                if "category" in json_obj and json_obj["category"] in mt_bench_list:
+                    data.append(json_obj)
+            elif task == "owt":
+                if "context" in json_obj:
+                    data.append(json_obj)
+            elif task == "cnndm":
+                if "article" in json_obj:
                     data.append(json_obj)
             else:
-                if json_obj["category"] == task:
+                if "category" in json_obj and json_obj["category"] == task:
                     data.append(json_obj)
 
     total_time=0
     total_token=0
     speeds0=[]
     for datapoint in data:
-        answer=datapoint["choices"][0]['turns']
-        tokens = 0
-        for i in answer:
-            tokens += (len(tokenizer(i).input_ids) - 1)
-        times = sum(datapoint["choices"][0]['wall_time'])
+        if isinstance(datapoint["choices"][0]['new_tokens'], list):
+            times = sum(datapoint["choices"][0]['wall_time'])
+        else:
+            times = datapoint["choices"][0]['wall_time']
+        
+        # Handle different data structures for different tasks
+        if task == "owt" and "completion" in datapoint["choices"][0]:
+            # OWT task has completion field
+            completion = datapoint["choices"][0]['completion']
+            tokens = len(tokenizer(completion).input_ids) - 1
+        elif task == "cnndm" and "summary" in datapoint["choices"][0]:
+            # CNNDM task has summary field
+            summary = datapoint["choices"][0]['summary']
+            tokens = len(tokenizer(summary).input_ids) - 1
+        elif "turns" in datapoint["choices"][0]:
+            # Standard task with turns field
+            answer = datapoint["choices"][0]['turns']
+            tokens = 0
+            for i in answer:
+                tokens += (len(tokenizer(i).input_ids) - 1)
+        else:
+            # Fallback to new_tokens if available
+            tokens = datapoint["choices"][0].get('new_tokens', 0)
+            
         speeds0.append(tokens / times)
-        total_time+=times
-        total_token+=tokens
+        total_time += times
+        total_token += tokens
 
     tokens_per_second = np.array(speeds).mean()
     tokens_per_second_baseline = np.array(speeds0).mean()
@@ -70,7 +107,7 @@ def speed(jsonl_file, jsonl_file_base, tokenizer, task=None, report=True):
 
 
 def get_single_speedup(jsonl_file, jsonl_file_base, tokenizer_path):
-    for subtask_name in ["mt_bench", "translation", "summarization", "qa", "math_reasoning", "rag", "overall"]:
+    for subtask_name in ["cnndm", "mt_bench", "translation", "summarization", "qa", "math_reasoning", "rag", "owt", "overall"]:
         speed(jsonl_file, jsonl_file_base, tokenizer_path, task=subtask_name)
 
 
@@ -89,7 +126,7 @@ def get_mean_speedup(tokenizer_path, jsonl_file_name, jsonl_file_base_name):
         "./data/spec_bench/model_answer_temp0_run_3/{}".format(jsonl_file_base_name),
                            ]
 
-    for subtask_name in ["mt_bench", "translation", "summarization", "qa", "math_reasoning", "rag", "overall"]:
+    for subtask_name in ["mt_bench", "translation", "summarization", "qa", "math_reasoning", "rag", "owt", "cnndm", "overall"]:
         print("=" * 30, "Task: ", subtask_name, "=" * 30)
         tokens_per_second_list = []
         tokens_per_second_baseline_list = []
