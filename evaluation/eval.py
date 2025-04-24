@@ -314,42 +314,22 @@ def get_model_answers_cnn(
     cuda_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES')
     print('CUDA VISIBLE DEVICES:', cuda_visible_devices)
 
-    # Load metadata for original articles if available
-    metadata_file = "data/cnn_dailymail/val_200_metadata.json"
-    original_articles = None
-    if os.path.exists(metadata_file):
-        with open(metadata_file, 'r') as f:
-            metadata = json.load(f)
-            original_articles = metadata['articles']
-
     # Process each sample
+    accept_lengths_tree = []
     for idx, tokens in enumerate(tqdm(token_data)):
         choices = []
         for i in range(num_choices):
             torch.manual_seed(i)
-            conv = get_conversation_template("vicuna")
             
-            # Get the article text - either from metadata or decode tokens
-            if original_articles:
-                article = original_articles[idx]
-            else:
-                # Remove padding (zeros) from tokens
-                valid_tokens = tokens[tokens != 0]
-                article = tokenizer.decode(valid_tokens.tolist())
-            
-            qs = f"Summarize:\n{article.strip()}\nSummary:"
-            conv.append_message(conv.roles[0], qs)
-            conv.append_message(conv.roles[1], None)
-            conv.stop_str = "</s>"
-            prompt = conv.get_prompt()
-            inputs = tokenizer([prompt], return_tensors="pt").to("cuda")
-            input_ids = inputs.input_ids
+            # Convert tokens to input format (similar to OWT approach)
+            input_ids = torch.tensor([tokens.tolist()], dtype=torch.long).to("cuda")
+            attention_mask = torch.ones_like(input_ids).to("cuda")
             
             try:
                 torch.cuda.synchronize()
                 start_time = time.time()
                 output_ids, new_token, step, accept_length_tree = forward_func(
-                    inputs,
+                    {"input_ids": input_ids, "attention_mask": attention_mask},
                     model,
                     tokenizer,
                     256,
@@ -357,23 +337,24 @@ def get_model_answers_cnn(
                 )
                 torch.cuda.synchronize()
                 total_time = time.time() - start_time
-                output_ids = output_ids[0][len(input_ids[0]):]
+                accept_lengths_tree.extend(accept_length_tree)
+                
+                # Get only the newly generated tokens
+                generated_ids = output_ids[0][len(input_ids[0]):]
 
-                if conv.stop_token_ids:
-                    stop_token_ids_index = [
-                        i
-                        for i, id in enumerate(output_ids)
-                        if id in conv.stop_token_ids
-                    ]
-                    if len(stop_token_ids_index) > 0:
-                        output_ids = output_ids[: stop_token_ids_index[0]]
-
-                output = tokenizer.decode(
-                    output_ids,
+                # Decode the full article for reference
+                article = tokenizer.decode(
+                    input_ids[0],
                     spaces_between_special_tokens=False,
                 )
-                if conv.stop_str and output.find(conv.stop_str) > 0:
-                    output = output[: output.find(conv.stop_str)]
+                
+                # Decode just the newly generated summary
+                output = tokenizer.decode(
+                    generated_ids,
+                    spaces_between_special_tokens=False,
+                )
+                
+                # Clean up any special tokens
                 for special_token in tokenizer.special_tokens_map.values():
                     if isinstance(special_token, list):
                         for special_tok in special_token:
@@ -381,24 +362,24 @@ def get_model_answers_cnn(
                     else:
                         output = output.replace(special_token, "")
                 output = output.strip()
-
-                if conv.name == "xgen" and output.startswith("Assistant:"):
-                    output = output.replace("Assistant:", "", 1).strip()
+                
             except RuntimeError as e:
                 print("ERROR article index: ", idx)
+                print(e)
                 output = "ERROR"
                 total_time = 0
                 step = 0
                 new_token = 0
                 accept_length_tree = []
 
+            # Store results for this choice
             choices.append({
                 "index": i, 
-                "summary": output, 
+                "summary": output,  # Using 'summary' as the key for CNN data
                 "decoding_steps": int(step), 
                 "new_tokens": int(new_token), 
                 "wall_time": total_time,
-                "accept_lengths": accept_length_tree  # Use the per-choice accept_length_tree
+                "accept_lengths": accept_length_tree
             })
 
         # Dump answers
@@ -414,7 +395,8 @@ def get_model_answers_cnn(
             }
             fout.write(json.dumps(ans_json) + "\n")
     
-    print("#Mean accepted tokens: ", np.mean(accept_length_tree))
+    if len(accept_lengths_tree) > 0:
+        print("#Mean accepted tokens: ", np.mean(accept_lengths_tree))
 
 
 @torch.inference_mode()

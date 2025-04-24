@@ -12,7 +12,7 @@ from datasets import load_dataset
 from transformers import AutoTokenizer
 import os
 
-def prepare_cnndm_samples(max_samples=10, max_token_threshold=768, output_file="data/cnn_dailymail/val_200.bin", save_metadata=True):
+def prepare_cnndm_samples(max_samples=200, max_token_threshold=768, output_file="data/cnn_dailymail/val_200.bin", save_metadata=True):
     """Prepare and save CNN/DailyMail samples as binary token file."""
     print("Preparing CNN/DailyMail samples...")
     
@@ -75,7 +75,7 @@ def prepare_cnndm_samples(max_samples=10, max_token_threshold=768, output_file="
             json.dump(metadata, f)
         print(f"Saved metadata to {metadata_file}")
 
-def prepare_owt_samples(max_samples=10, context_length=768, input_file="data/openwebtext/val.bin", output_file="data/openwebtext/val_200.bin"):
+def prepare_owt_samples(max_samples=200, context_length=768, input_file="data/openwebtext/val.bin", output_file="data/openwebtext/val_200.bin"):
     """Prepare and save OpenWebText samples."""
     print("Preparing OpenWebText samples...")
     
